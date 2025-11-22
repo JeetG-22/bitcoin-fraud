@@ -1,47 +1,33 @@
-# Running the Program
-
-The program should be run from delay_predictor.py
+# Machine Learning Project: Bitcoin Fraud Detection
 
 ### Create Python Virtual Environment
 
-In this project, we utilized Python virtual enviroments to keep pip packages consistent across all machines, while avoiding externally managed environment errors.
-
-To create it on MacOS, we use:
-
-```shell
-source create_venv.sh
-```
-
-which implicitly runs:
+We use Python virtual enviroments to keep pip packages consistent and localized:
 
 ```shell
 python3 -m venv venv
+# If on Windows CMD, run .\venv\Scripts\activate.bat instead of the following
 source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Unfortunately, this only runs on MacOS (bash/zsh). If you are running Windows command prompt you have to type:
+### Running
 
-```shell
-python3 -m venv venv
-.\venv\Scripts\activate.bat
-```
+Run the following files in the specified order:
 
-If running Windows PowerShell type:
-
-```shell
-python3 -m venv venv
-.\venv\Scripts\Activate.ps1
-```
-
-If we want to update the requirements.txt file with the packages that we've installed with pip thus far, we can run:
-
-```shell
-pip freeze > requirements.txt
-```
-
-and then if we need to update the requirements again later:
-
-```shell
-pip install -r requirements.txt
-```
+1. `elliptic_dataset_download.py`
+   - Download dataset from online to local machine.
+1. `notebooks/01_eda.ipynb` (Optional)
+   - Basic exploratory analysis.
+1. `notebooks/02_preprocessing.ipynb`
+   - Combines labels and features into joint dataset.
+   - Assigns column names to unnamed features.
+   - Creates reproducible train-test split.
+1. `notebooks/03_visualizations.ipynb`
+   - Calculates and visualizes 2D projections using PCA and UMAP.
+   - Cumulative explained variance from PCA components.
+1. `notebooks/04_supervised_models.ipynb`
+    - Trains a Random Forest and Logistic Regression model.
+    - Performs hyperparameter tuning with 5-fold cross-validation.
+    - Calculates evaluation metrics (f1, ROC-AUC, accuracy, etc).
+    - Visualizes incorrect predictions on PCA/UMAP projections.
