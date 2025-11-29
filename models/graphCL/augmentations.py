@@ -73,7 +73,6 @@ class TemporalAugmentor:
         x = data.x
         mask = torch.rand(x.size(), device=x.device) < self.feat_prob
         x[mask] = 0
-        data.x = x
         return data
 
     def get_view(self, data, mode='temporal_edge'):

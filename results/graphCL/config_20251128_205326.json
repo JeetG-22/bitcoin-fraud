@@ -1,0 +1,18 @@
+{
+  "run_id": "20251128_205326",
+  "batch_size": 4096,
+  "hidden_channels": 256,
+  "out_channels": 128,
+  "lr_pretrain": 0.0005,
+  "epochs_pretrain": 300,
+  "num_neighbors": [
+    25,
+    15
+  ],
+  "temperature": 0.1,
+  "intra_step_drop_prob": 0.5,
+  "inter_step_drop_prob": 0.0,
+  "num_nodes": 203769,
+  "num_edges": 8822681,
+  "device": "cuda"
+}

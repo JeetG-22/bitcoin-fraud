@@ -1,14 +1,23 @@
 import os
+import sys
 import json
 import argparse
 from datetime import datetime
+import builtins
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import pandas as pd
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
+
+# Add current directory to path to allow imports
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 
 try:
     from dotenv import load_dotenv
@@ -23,7 +32,7 @@ from augmentations import TemporalAugmentor
 def parse_args():
     parser = argparse.ArgumentParser(description="Train GraphCL on Elliptic++ dataset")
     parser.add_argument("--epochs", type=int, default=300, help="Number of pre-training epochs")
-    parser.add_argument("--batch-size", type=int, default=4096, help="Batch size for training")
+    parser.add_argument("--batch-size", type=int, default=4096, help="Batch size for training (per GPU)")
     parser.add_argument("--hidden-channels", type=int, default=256, help="Hidden layer size")
     parser.add_argument("--out-channels", type=int, default=128, help="Output embedding size")
     parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate for pre-training")
@@ -33,13 +42,29 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_device():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Running on: {device}")
-    if device.type == 'cuda':
-        print(f"  GPU: {torch.cuda.get_device_name(0)}")
-        print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    return device
+def setup_ddp():
+    """Initialize Distributed Data Parallelism if available."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        # Only print on rank 0 to avoid clutter
+        if rank == 0:
+            print(f"Initialized DDP: World Size {world_size}")
+        return True, rank, local_rank, world_size, device
+    else:
+        # Fallback for non-distributed
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Initialized Single-GPU: Device {device}")
+        return False, 0, 0, 1, device
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def perform_graph_contraction(project_root):
@@ -104,9 +129,10 @@ def perform_graph_contraction(project_root):
     print("Done.")
 
 
-def load_data(project_root, device):
+def load_data(project_root):
     """
     Load the Elliptic++ dataset and create PyG Data object.
+    Returns data on CPU.
     """
     print("\n" + "="*60)
     print("STEP 2: LOADING DATA")
@@ -124,7 +150,18 @@ def load_data(project_root, device):
     df_features = df_features.set_index("txId")
 
     feature_cols = [c for c in df_features.columns if c != "timeStep"]
-    x = torch.tensor(df_features[feature_cols].values, dtype=torch.float)
+    
+    # Handle NaN/Inf in features
+    feature_values = df_features[feature_cols].values
+    feature_values = pd.DataFrame(feature_values).fillna(0).values  # Replace NaN with 0
+    
+    x = torch.tensor(feature_values, dtype=torch.float)
+    
+    # Check for remaining issues
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        print("WARNING: NaN/Inf detected in features, replacing with 0")
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    
     time_vals = df_features["timeStep"].values
     time = torch.tensor(time_vals, dtype=torch.long)
 
@@ -184,29 +221,41 @@ def load_data(project_root, device):
     print(f"  Num edges: {data.num_edges:,}")
     print(f"  Features shape: {data.x.shape}")
     print(f"  Class distribution: {torch.unique(data.y, return_counts=True)}")
-
-    data = data.to(device)
-    print(f"Data moved to {device}.")
     
     return data
 
 
 def contrastive_loss(z1, z2, temperature, device):
-    """NT-Xent contrastive loss."""
+    """NT-Xent contrastive loss with numerical stability."""
+    # Handle empty batches
+    if z1.size(0) == 0 or z2.size(0) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # Check for NaN/Inf in inputs
+    if torch.isnan(z1).any() or torch.isnan(z2).any():
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
     z1 = F.normalize(z1, dim=1)
     z2 = F.normalize(z2, dim=1)
+    
+    # Compute similarity matrix
     sim_matrix = torch.mm(z1, z2.t()) / temperature
+    
+    # Clamp to prevent numerical overflow in cross_entropy
+    sim_matrix = torch.clamp(sim_matrix, min=-50, max=50)
+    
     labels = torch.arange(z1.size(0)).to(device)
     return F.cross_entropy(sim_matrix, labels)
 
 
-def train_encoder(data, args, device, results_dir, run_id):
+def train_encoder(data, args, device, results_dir, run_id, is_distributed, rank, local_rank, world_size):
     """
     Train the GCL encoder using contrastive learning.
     """
-    print("\n" + "="*60)
-    print("STEP 3: CONTRASTIVE PRE-TRAINING")
-    print("="*60)
+    if rank == 0:
+        print("\n" + "="*60)
+        print("STEP 3: CONTRASTIVE PRE-TRAINING")
+        print("="*60)
     
     # Config
     config = {
@@ -223,35 +272,62 @@ def train_encoder(data, args, device, results_dir, run_id):
         "num_nodes": data.num_nodes,
         "num_edges": data.num_edges,
         "device": str(device),
+        "distributed": is_distributed,
+        "world_size": world_size
     }
     
-    # Save config
-    with open(os.path.join(results_dir, f"config_{run_id}.json"), "w") as f:
-        json.dump(config, f, indent=2)
+    # Save config (only rank 0)
+    if rank == 0:
+        with open(os.path.join(results_dir, f"config_{run_id}.json"), "w") as f:
+            json.dump(config, f, indent=2)
     
-    # Setup
+    # Prepare input nodes for DDP
+    if is_distributed:
+        # Get all training indices
+        train_indices = data.train_mask.nonzero(as_tuple=False).view(-1)
+        # Split indices among ranks
+        total_len = len(train_indices)
+        chunk_size = total_len // world_size
+        start = rank * chunk_size
+        end = start + chunk_size if rank != world_size - 1 else total_len
+        input_nodes = train_indices[start:end]
+        print(f"Rank {rank}: Processing {len(input_nodes)}/{total_len} training nodes")
+    else:
+        input_nodes = data.train_mask
+
+    # Setup Loader
+    # Note: data is on CPU, which is good for NeighborLoader memory usage
     train_loader = NeighborLoader(
-        data.cpu(),
+        data,
         num_neighbors=[25, 15],
         batch_size=args.batch_size,
-        input_nodes=data.train_mask,
+        input_nodes=input_nodes,
         shuffle=True,
         num_workers=args.num_workers
     )
 
     encoder = GCL_Encoder(data.num_features, args.hidden_channels, args.out_channels).to(device)
+    
+    if is_distributed:
+        encoder = DDP(encoder, device_ids=[local_rank])
+        
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
     augmentor = TemporalAugmentor(intra_step_drop_prob=0.5, inter_step_drop_prob=0.0)
 
-    print(f"Encoder: {sum(p.numel() for p in encoder.parameters()):,} parameters")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Epochs: {args.epochs}")
-    print("\nStarting Unsupervised Pre-training...")
+    if rank == 0:
+        print(f"Encoder: {sum(p.numel() for p in encoder.parameters()):,} parameters")
+        print(f"Batch size: {args.batch_size} (per GPU)")
+        print(f"Epochs: {args.epochs}")
+        print("\nStarting Unsupervised Pre-training...")
     
     encoder.train()
     loss_history = []
 
     for epoch in range(1, args.epochs + 1):
+        if is_distributed:
+            # NeighborLoader with manual input_nodes splitting doesn't need set_epoch
+            pass
+            
         total_loss = 0
         steps = 0
 
@@ -261,50 +337,85 @@ def train_encoder(data, args, device, results_dir, run_id):
             view1 = augmentor.get_view(batch, mode='temporal_edge')
             view2 = augmentor.get_view(batch, mode='feature')
 
-            _, z1 = encoder(view1.x, view1.edge_index, view1.edge_attr)
-            _, z2 = encoder(view2.x, view2.edge_index, view2.edge_attr)
+            # Manually concatenate tensors to avoid PyG Batch.from_data_list issues
+            # Concatenate node features
+            x_combined = torch.cat([view1.x, view2.x], dim=0)
+            
+            # Concatenate edge_index with offset for second view
+            num_nodes_v1 = view1.num_nodes
+            edge_index_v2_offset = view2.edge_index + num_nodes_v1
+            edge_index_combined = torch.cat([view1.edge_index, edge_index_v2_offset], dim=1)
+            
+            # Concatenate edge_attr
+            if view1.edge_attr is not None and view2.edge_attr is not None:
+                edge_attr_combined = torch.cat([view1.edge_attr, view2.edge_attr], dim=0)
+            else:
+                edge_attr_combined = None
+            
+            # Single forward pass through encoder
+            _, z_combined = encoder(x_combined, edge_index_combined, edge_attr_combined)
+            
+            # Split embeddings back
+            z1 = z_combined[:num_nodes_v1]
+            z2 = z_combined[num_nodes_v1:]
 
             loss = contrastive_loss(z1, z2, temperature=0.1, device=device)
 
+            # Skip batch if loss is NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+            
             optimizer.step()
 
             total_loss += loss.item()
             steps += 1
 
-        avg_loss = total_loss / steps
-        loss_history.append(avg_loss)
-        print(f"Epoch {epoch:03d} | Contrastive Loss: {avg_loss:.4f}")
+        avg_loss = total_loss / steps if steps > 0 else 0
+        
+        # Reduce loss for logging (optional, but good for monitoring)
+        if is_distributed:
+            loss_tensor = torch.tensor(avg_loss).to(device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg_loss = loss_tensor.item() / world_size
 
-        # Checkpoint every 50 epochs
-        if epoch % 50 == 0:
-            checkpoint_path = os.path.join(results_dir, f"encoder_checkpoint_epoch{epoch}_{run_id}.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': encoder.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss_history': loss_history,
-            }, checkpoint_path)
-            print(f"  💾 Checkpoint saved: {checkpoint_path}")
+        if rank == 0:
+            loss_history.append(avg_loss)
+            print(f"Epoch {epoch:03d} | Contrastive Loss: {avg_loss:.4f}")
 
-    print("Pre-training complete.")
+            # Checkpoint every 50 epochs
+            if epoch % 50 == 0:
+                model_to_save = encoder.module if is_distributed else encoder
+                checkpoint_path = os.path.join(results_dir, f"encoder_checkpoint_epoch{epoch}_{run_id}.pt")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model_to_save.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss_history': loss_history,
+                }, checkpoint_path)
+                print(f"  💾 Checkpoint saved: {checkpoint_path}")
 
-    # Save final model
-    final_model_path = os.path.join(results_dir, f"encoder_final_{run_id}.pt")
-    torch.save({
-        'epoch': args.epochs,
-        'model_state_dict': encoder.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss_history': loss_history,
-        'config': config,
-    }, final_model_path)
-    print(f"✅ Final encoder saved: {final_model_path}")
+    if rank == 0:
+        print("Pre-training complete.")
+        model_to_save = encoder.module if is_distributed else encoder
+        final_model_path = os.path.join(results_dir, f"encoder_final_{run_id}.pt")
+        torch.save({
+            'epoch': args.epochs,
+            'model_state_dict': model_to_save.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss_history': loss_history,
+            'config': config,
+        }, final_model_path)
+        print(f"✅ Final encoder saved: {final_model_path}")
 
-    # Save loss history
-    loss_df = pd.DataFrame({'epoch': range(1, len(loss_history) + 1), 'loss': loss_history})
-    loss_df.to_csv(os.path.join(results_dir, f"loss_history_{run_id}.csv"), index=False)
-    print(f"✅ Loss history saved.")
+        loss_df = pd.DataFrame({'epoch': range(1, len(loss_history) + 1), 'loss': loss_history})
+        loss_df.to_csv(os.path.join(results_dir, f"loss_history_{run_id}.csv"), index=False)
+        print(f"✅ Loss history saved.")
 
     return encoder, config
 
@@ -322,10 +433,17 @@ def evaluate(encoder, data, device, results_dir, run_id):
 
     print("Generating node embeddings for the whole graph...")
     encoder.eval()
+    
+    # Ensure encoder is on device
+    encoder = encoder.to(device)
+    
+    # Move data to device for full-batch inference if it fits
+    # If OOM, we might need to do mini-batch inference or CPU inference
+    data_device = data.to(device)
 
     with torch.no_grad():
         try:
-            embeddings, _ = encoder(data.x, data.edge_index, data.edge_attr)
+            embeddings, _ = encoder(data_device.x, data_device.edge_index, data_device.edge_attr)
         except RuntimeError as e:
             print(f"GPU OOM: {e}")
             print("Switching encoder to CPU for inference...")
@@ -341,8 +459,6 @@ def evaluate(encoder, data, device, results_dir, run_id):
     print(f"  Std: {embeddings.std().item():.4f}")
     print(f"  Min: {embeddings.min().item():.4f}")
     print(f"  Max: {embeddings.max().item():.4f}")
-    print(f"  Has NaN: {torch.isnan(embeddings).any().item()}")
-    print(f"  Has Inf: {torch.isinf(embeddings).any().item()}")
 
     if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
         print("⚠️ Sanitizing embeddings (replacing NaN/Inf with 0)...")
@@ -434,9 +550,6 @@ def evaluate(encoder, data, device, results_dir, run_id):
         print(f"\nConfusion Matrix:")
         print(f"  [[TN={cm[0,0]:5d}, FP={cm[0,1]:5d}]")
         print(f"   [FN={cm[1,0]:5d}, TP={cm[1,1]:5d}]]")
-        print(f"\nPer-Class Breakdown:")
-        print(f"  Licit (0):   {cm[0,0]:,} correct / {cm[0].sum():,} total = {cm[0,0]/cm[0].sum():.2%}")
-        print(f"  Illicit (1): {cm[1,1]:,} correct / {cm[1].sum():,} total = {cm[1,1]/cm[1].sum():.2%}")
 
     # Save classifier
     classifier_path = os.path.join(results_dir, f"classifier_{run_id}.pt")
@@ -452,12 +565,6 @@ def evaluate(encoder, data, device, results_dir, run_id):
         "f1_score": float(f1),
         "f1_macro": float(f1_macro),
         "confusion_matrix": cm.tolist(),
-        "train_samples": int(len(y_train)),
-        "test_samples": int(len(y_test)),
-        "class_distribution_train": {
-            "licit": int(train_class_counts[0].item()),
-            "illicit": int(train_class_counts[1].item())
-        },
         "eval_history": eval_history,
     }
 
@@ -466,76 +573,88 @@ def evaluate(encoder, data, device, results_dir, run_id):
         json.dump(results, f, indent=2)
     print(f"✅ Results saved: {results_path}")
 
-    # Save predictions
-    predictions_df = pd.DataFrame({
-        'y_true': y_true,
-        'y_pred': y_pred,
-        'prob_illicit': y_prob,
-    })
-    predictions_path = os.path.join(results_dir, f"predictions_{run_id}.csv")
-    predictions_df.to_csv(predictions_path, index=False)
-    print(f"✅ Predictions saved: {predictions_path}")
-
     return results
 
 
 def main():
     args = parse_args()
     
+    # Setup DDP
+    is_distributed, rank, local_rank, world_size, device = setup_ddp()
+    
+    # Suppress printing on non-zero ranks
+    if rank != 0:
+        def print_pass(*args, **kwargs):
+            pass
+        builtins.print = print_pass
+
     # Setup project root
     if args.project_root:
         project_root = args.project_root
     else:
         project_root = os.environ.get("PROJECT_ROOT")
         if not project_root:
-            # Try to infer from script location
             script_dir = os.path.dirname(os.path.abspath(__file__))
             project_root = os.path.dirname(os.path.dirname(script_dir))
     
-    print("="*60)
-    print("GraphCL Training for Bitcoin Fraud Detection")
-    print("="*60)
-    print(f"Project root: {project_root}")
+    if rank == 0:
+        print("="*60)
+        print("GraphCL Training for Bitcoin Fraud Detection")
+        print("="*60)
+        print(f"Project root: {project_root}")
+        print(f"Distributed: {is_distributed} (World Size: {world_size})")
     
-    # Setup device
-    device = get_device()
-    
-    # Setup results directory
+    # Setup results directory (only rank 0 needs to create it, but all need path)
     results_dir = os.path.join(project_root, "results", "graphCL")
-    os.makedirs(results_dir, exist_ok=True)
+    if rank == 0:
+        os.makedirs(results_dir, exist_ok=True)
+    
+    # Sync to ensure dir exists
+    if is_distributed:
+        dist.barrier()
+        
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"Results will be saved to: {results_dir}")
-    print(f"Run ID: {run_id}")
+    if rank == 0:
+        print(f"Results will be saved to: {results_dir}")
+        print(f"Run ID: {run_id}")
     
-    # Step 1: Graph contraction (optional)
-    if not args.skip_contraction:
-        perform_graph_contraction(project_root)
-    else:
-        print("\n⏭️ Skipping graph contraction (using existing contracted edge list)")
+    # Step 1: Graph contraction (only rank 0)
+    if rank == 0:
+        if not args.skip_contraction:
+            perform_graph_contraction(project_root)
+        else:
+            print("\n⏭️ Skipping graph contraction (using existing contracted edge list)")
     
-    # Step 2: Load data
-    data = load_data(project_root, device)
+    if is_distributed:
+        dist.barrier()
     
-    # Step 3: Train encoder
-    encoder, config = train_encoder(data, args, device, results_dir, run_id)
+    # Step 2: Load data (all ranks load data, but keep on CPU)
+    data = load_data(project_root)
     
-    # Step 4: Evaluate
-    results = evaluate(encoder, data, device, results_dir, run_id)
+    # Step 3: Train encoder (Distributed)
+    encoder, config = train_encoder(data, args, device, results_dir, run_id, is_distributed, rank, local_rank, world_size)
     
-    # Summary
-    print("\n" + "="*60)
-    print("📁 ALL FILES SAVED TO:", results_dir)
-    print("="*60)
-    print(f"  - config_{run_id}.json")
-    print(f"  - encoder_final_{run_id}.pt")
-    print(f"  - loss_history_{run_id}.csv")
-    print(f"  - embeddings_{run_id}.pt")
-    print(f"  - classifier_{run_id}.pt")
-    print(f"  - results_{run_id}.json")
-    print(f"  - predictions_{run_id}.csv")
-    print(f"\nTo download via scp:")
-    print(f"  scp -r <user>@<cluster>:{results_dir} ./local_results/")
-    print("\n✅ Training complete!")
+    # Step 4: Evaluate (Only Rank 0)
+    if rank == 0:
+        # Unwrap DDP model for evaluation
+        if is_distributed:
+            encoder = encoder.module
+        results = evaluate(encoder, data, device, results_dir, run_id)
+        
+        print("\n" + "="*60)
+        print("📁 ALL FILES SAVED TO:", results_dir)
+        print("="*60)
+        print(f"  - config_{run_id}.json")
+        print(f"  - encoder_final_{run_id}.pt")
+        print(f"  - loss_history_{run_id}.csv")
+        print(f"  - embeddings_{run_id}.pt")
+        print(f"  - classifier_{run_id}.pt")
+        print(f"  - results_{run_id}.json")
+        print(f"\nTo download via scp:")
+        print(f"  scp -r <user>@<cluster>:{results_dir} ./local_results/")
+        print("\n✅ Training complete!")
+    
+    cleanup_ddp()
 
 
 if __name__ == "__main__":
