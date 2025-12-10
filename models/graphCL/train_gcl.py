@@ -14,7 +14,6 @@ from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
 
-# Add current directory to path to allow imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
@@ -51,7 +50,6 @@ def setup_ddp():
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
-        # Only print on rank 0 to avoid clutter
         if rank == 0:
             print(f"Initialized DDP: World Size {world_size}")
         return True, rank, local_rank, world_size, device
@@ -91,7 +89,6 @@ def perform_graph_contraction(project_root):
     df_addr_tx = pd.read_csv(addr_tx_path)
     df_addr_tx.columns = ["address", "txId_dst"]
 
-    # Perform contraction
     print("Performing Graph Contraction (Tx->Addr + Addr->Tx = Tx->Tx)...")
     df_contracted = pd.merge(df_tx_addr, df_addr_tx, on="address", how="inner")
 
@@ -99,19 +96,16 @@ def perform_graph_contraction(project_root):
     print(f"  - Addr->Tx edges: {len(df_addr_tx):,}")
     print(f"  - Contracted Tx->Tx edges: {len(df_contracted):,}")
 
-    # Load timestamps
     features_path = os.path.join(ELLIPTIC_PP_DIR, "txs_features.csv")
     print(f"Loading timestamps from {features_path}...")
     df_features = pd.read_csv(features_path, usecols=["txId", "Time step"])
     time_map = df_features.set_index("txId")["Time step"].to_dict()
 
-    # Map timestamps
     print("Mapping timestamps to edges...")
     df_contracted["src_time"] = df_contracted["txId_src"].map(time_map)
     df_contracted["dst_time"] = df_contracted["txId_dst"].map(time_map)
     df_contracted = df_contracted.dropna(subset=["src_time", "dst_time"])
 
-    # Calculate stats
     num_same_time = (df_contracted["dst_time"] == df_contracted["src_time"]).sum()
     num_forward = (df_contracted["dst_time"] > df_contracted["src_time"]).sum()
     num_backward = (df_contracted["dst_time"] < df_contracted["src_time"]).sum()
@@ -121,7 +115,6 @@ def perform_graph_contraction(project_root):
     print(f"  Forward-causal edges: {num_forward:,} ({100*num_forward/len(df_contracted):.1f}%)")
     print(f"  Backward-invalid edges: {num_backward:,} ({100*num_backward/len(df_contracted):.3f}%)")
 
-    # Save valid edges only
     valid_edges = df_contracted[df_contracted["dst_time"] >= df_contracted["src_time"]]
     output_file = os.path.join(ELLIPTIC_PP_DIR, "elliptic_pp_contracted_edgelist.csv")
     print(f"\nSaving {len(valid_edges):,} valid causal edges to {output_file}...")
@@ -143,7 +136,6 @@ def load_data(project_root):
     classes_path = os.path.join(ELLIPTIC_PP_DIR, "txs_classes.csv")
     edges_path = os.path.join(ELLIPTIC_PP_DIR, "elliptic_pp_contracted_edgelist.csv")
 
-    # Load features
     print("Loading features...")
     df_features = pd.read_csv(features_path)
     df_features = df_features.rename(columns={"Time step": "timeStep"})
@@ -151,13 +143,11 @@ def load_data(project_root):
 
     feature_cols = [c for c in df_features.columns if c != "timeStep"]
     
-    # Handle NaN/Inf in features
     feature_values = df_features[feature_cols].values
     feature_values = pd.DataFrame(feature_values).fillna(0).values  # Replace NaN with 0
     
     x = torch.tensor(feature_values, dtype=torch.float)
-    
-    # Check for remaining issues
+
     if torch.isnan(x).any() or torch.isinf(x).any():
         print("WARNING: NaN/Inf detected in features, replacing with 0")
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -165,7 +155,6 @@ def load_data(project_root):
     time_vals = df_features["timeStep"].values
     time = torch.tensor(time_vals, dtype=torch.long)
 
-    # Load classes
     print(f"Loading classes from {classes_path}...")
     df_classes = pd.read_csv(classes_path).set_index("txId")
     df_classes = df_classes.reindex(df_features.index)
@@ -173,11 +162,9 @@ def load_data(project_root):
     class_map = {1: 1, 2: 0, 3: -1}  # 1=Illicit, 2=Licit, 3=Unknown
     y = torch.tensor(df_classes["class"].map(class_map).fillna(-1).values, dtype=torch.long)
 
-    # Create node mapping
     tx_ids = list(df_features.index)
     node_mapping = {int(txid): idx for idx, txid in enumerate(tx_ids)}
 
-    # Load edges
     print(f"Loading edges from {edges_path}...")
     df_edges = pd.read_csv(edges_path)
 
@@ -185,7 +172,6 @@ def load_data(project_root):
     valid_dst = df_edges["txId_dst"].isin(node_mapping)
     df_edges = df_edges[valid_src & valid_dst]
 
-    # Deduplicate edges
     print("Deduplicating edges (calculating weights)...")
     df_edges_grouped = df_edges.groupby(["txId_src", "txId_dst"]).size().reset_index(name="weight")
 
@@ -197,11 +183,9 @@ def load_data(project_root):
     edge_index = torch.tensor([src_idx, dst_idx], dtype=torch.long)
     edge_attr = torch.tensor(df_edges_grouped["weight"].values, dtype=torch.float).view(-1, 1)
 
-    # Create masks
     train_mask = time < 35
     test_mask = time >= 35
 
-    # Create Data object
     data = Data(
         x=x, 
         edge_index=edge_index, 
@@ -227,21 +211,18 @@ def load_data(project_root):
 
 def contrastive_loss(z1, z2, temperature, device):
     """NT-Xent contrastive loss with numerical stability."""
-    # Handle empty batches
+
     if z1.size(0) == 0 or z2.size(0) == 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
-    
-    # Check for NaN/Inf in inputs
+
     if torch.isnan(z1).any() or torch.isnan(z2).any():
         return torch.tensor(0.0, device=device, requires_grad=True)
     
     z1 = F.normalize(z1, dim=1)
     z2 = F.normalize(z2, dim=1)
-    
-    # Compute similarity matrix
+
     sim_matrix = torch.mm(z1, z2.t()) / temperature
-    
-    # Clamp to prevent numerical overflow in cross_entropy
+
     sim_matrix = torch.clamp(sim_matrix, min=-50, max=50)
     
     labels = torch.arange(z1.size(0)).to(device)
@@ -275,17 +256,13 @@ def train_encoder(data, args, device, results_dir, run_id, is_distributed, rank,
         "distributed": is_distributed,
         "world_size": world_size
     }
-    
-    # Save config (only rank 0)
+
     if rank == 0:
         with open(os.path.join(results_dir, f"config_{run_id}.json"), "w") as f:
             json.dump(config, f, indent=2)
-    
-    # Prepare input nodes for DDP
+
     if is_distributed:
-        # Get all training indices
         train_indices = data.train_mask.nonzero(as_tuple=False).view(-1)
-        # Split indices among ranks
         total_len = len(train_indices)
         chunk_size = total_len // world_size
         start = rank * chunk_size
@@ -294,9 +271,6 @@ def train_encoder(data, args, device, results_dir, run_id, is_distributed, rank,
         print(f"Rank {rank}: Processing {len(input_nodes)}/{total_len} training nodes")
     else:
         input_nodes = data.train_mask
-
-    # Setup Loader
-    # Note: data is on CPU, which is good for NeighborLoader memory usage
     train_loader = NeighborLoader(
         data,
         num_neighbors=[25, 15],
@@ -325,7 +299,6 @@ def train_encoder(data, args, device, results_dir, run_id, is_distributed, rank,
 
     for epoch in range(1, args.epochs + 1):
         if is_distributed:
-            # NeighborLoader with manual input_nodes splitting doesn't need set_epoch
             pass
             
         total_loss = 0
@@ -336,39 +309,24 @@ def train_encoder(data, args, device, results_dir, run_id, is_distributed, rank,
 
             view1 = augmentor.get_view(batch, mode='temporal_edge')
             view2 = augmentor.get_view(batch, mode='feature')
-
-            # Manually concatenate tensors to avoid PyG Batch.from_data_list issues
-            # Concatenate node features
             x_combined = torch.cat([view1.x, view2.x], dim=0)
-            
-            # Concatenate edge_index with offset for second view
             num_nodes_v1 = view1.num_nodes
             edge_index_v2_offset = view2.edge_index + num_nodes_v1
             edge_index_combined = torch.cat([view1.edge_index, edge_index_v2_offset], dim=1)
-            
-            # Concatenate edge_attr
             if view1.edge_attr is not None and view2.edge_attr is not None:
                 edge_attr_combined = torch.cat([view1.edge_attr, view2.edge_attr], dim=0)
             else:
                 edge_attr_combined = None
-            
-            # Single forward pass through encoder
             _, z_combined = encoder(x_combined, edge_index_combined, edge_attr_combined)
-            
-            # Split embeddings back
             z1 = z_combined[:num_nodes_v1]
             z2 = z_combined[num_nodes_v1:]
 
             loss = contrastive_loss(z1, z2, temperature=0.1, device=device)
-
-            # Skip batch if loss is NaN
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
 
             optimizer.zero_grad()
             loss.backward()
-            
-            # Gradient clipping to prevent exploding gradients
             torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
             
             optimizer.step()
@@ -377,8 +335,6 @@ def train_encoder(data, args, device, results_dir, run_id, is_distributed, rank,
             steps += 1
 
         avg_loss = total_loss / steps if steps > 0 else 0
-        
-        # Reduce loss for logging (optional, but good for monitoring)
         if is_distributed:
             loss_tensor = torch.tensor(avg_loss).to(device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
@@ -387,8 +343,6 @@ def train_encoder(data, args, device, results_dir, run_id, is_distributed, rank,
         if rank == 0:
             loss_history.append(avg_loss)
             print(f"Epoch {epoch:03d} | Contrastive Loss: {avg_loss:.4f}")
-
-            # Checkpoint every 50 epochs
             if epoch % 50 == 0:
                 model_to_save = encoder.module if is_distributed else encoder
                 checkpoint_path = os.path.join(results_dir, f"encoder_checkpoint_epoch{epoch}_{run_id}.pt")
@@ -433,12 +387,7 @@ def evaluate(encoder, data, device, results_dir, run_id):
 
     print("Generating node embeddings for the whole graph...")
     encoder.eval()
-    
-    # Ensure encoder is on device
     encoder = encoder.to(device)
-    
-    # Move data to device for full-batch inference if it fits
-    # If OOM, we might need to do mini-batch inference or CPU inference
     data_device = data.to(device)
 
     with torch.no_grad():
@@ -466,12 +415,10 @@ def evaluate(encoder, data, device, results_dir, run_id):
 
     embeddings = F.normalize(embeddings, dim=1)
 
-    # Save embeddings
     embeddings_path = os.path.join(results_dir, f"embeddings_{run_id}.pt")
     torch.save(embeddings.cpu(), embeddings_path)
     print(f"✅ Embeddings saved: {embeddings_path}")
 
-    # Setup classifier
     X = embeddings.detach()
     y = data.y.to(device)
 
@@ -520,7 +467,6 @@ def evaluate(encoder, data, device, results_dir, run_id):
                     best_f1 = val_f1
             print(f"  Epoch {epoch:3d} | Loss: {loss.item():.4f} | Val F1: {val_f1:.4f}")
 
-    # Final evaluation
     classifier.eval()
     with torch.no_grad():
         out_test = classifier(X_test)
@@ -551,12 +497,10 @@ def evaluate(encoder, data, device, results_dir, run_id):
         print(f"  [[TN={cm[0,0]:5d}, FP={cm[0,1]:5d}]")
         print(f"   [FN={cm[1,0]:5d}, TP={cm[1,1]:5d}]]")
 
-    # Save classifier
     classifier_path = os.path.join(results_dir, f"classifier_{run_id}.pt")
     torch.save(classifier.state_dict(), classifier_path)
     print(f"\n✅ Classifier saved: {classifier_path}")
 
-    # Save results
     results = {
         "run_id": run_id,
         "accuracy": float(acc),
@@ -578,17 +522,14 @@ def evaluate(encoder, data, device, results_dir, run_id):
 
 def main():
     args = parse_args()
-    
-    # Setup DDP
+
     is_distributed, rank, local_rank, world_size, device = setup_ddp()
-    
-    # Suppress printing on non-zero ranks
+
     if rank != 0:
         def print_pass(*args, **kwargs):
             pass
         builtins.print = print_pass
 
-    # Setup project root
     if args.project_root:
         project_root = args.project_root
     else:
@@ -603,13 +544,11 @@ def main():
         print("="*60)
         print(f"Project root: {project_root}")
         print(f"Distributed: {is_distributed} (World Size: {world_size})")
-    
-    # Setup results directory (only rank 0 needs to create it, but all need path)
+
     results_dir = os.path.join(project_root, "results", "graphCL")
     if rank == 0:
         os.makedirs(results_dir, exist_ok=True)
-    
-    # Sync to ensure dir exists
+
     if is_distributed:
         dist.barrier()
         
@@ -617,8 +556,7 @@ def main():
     if rank == 0:
         print(f"Results will be saved to: {results_dir}")
         print(f"Run ID: {run_id}")
-    
-    # Step 1: Graph contraction (only rank 0)
+
     if rank == 0:
         if not args.skip_contraction:
             perform_graph_contraction(project_root)
@@ -627,16 +565,12 @@ def main():
     
     if is_distributed:
         dist.barrier()
-    
-    # Step 2: Load data (all ranks load data, but keep on CPU)
+
     data = load_data(project_root)
-    
-    # Step 3: Train encoder (Distributed)
+
     encoder, config = train_encoder(data, args, device, results_dir, run_id, is_distributed, rank, local_rank, world_size)
-    
-    # Step 4: Evaluate (Only Rank 0)
+
     if rank == 0:
-        # Unwrap DDP model for evaluation
         if is_distributed:
             encoder = encoder.module
         results = evaluate(encoder, data, device, results_dir, run_id)

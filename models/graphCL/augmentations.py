@@ -14,7 +14,6 @@ class TemporalAugmentor:
         t_src = data.time[src]
         t_dst = data.time[dst]
 
-        # assumes backward edges are filtered out
         is_same_step = (t_src == t_dst)
         is_forward = (t_dst > t_src)
 
@@ -41,17 +40,9 @@ class TemporalAugmentor:
         """
         data = data.clone()
         num_nodes = data.num_nodes
-        
-        # Pick a random anchor node in the batch
+
         anchor = torch.randint(0, num_nodes, (1,)).item()
         anchor_time = data.time[anchor]
-
-        # In this view, we only want to keep nodes that represent a valid flow 
-        # starting near the anchor or leading to the anchor within a window.
-        # Simple heuristic: Keep nodes within [time, time + k] relative to anchor
-        # to enforce local temporal consistency.
-        # temporal window around the anchor
-        # (e.g., -1 step (predecessors) to +2 steps (successors))
         valid_time_mask = (data.time >= anchor_time - 1) & (data.time <= anchor_time + 2)
 
         subset = torch.arange(num_nodes, device=data.x.device)[valid_time_mask]

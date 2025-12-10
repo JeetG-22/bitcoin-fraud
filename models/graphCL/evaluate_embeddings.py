@@ -8,7 +8,6 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix, roc_auc_score, average_precision_score
 
-# Add current directory to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
@@ -38,7 +37,6 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, device, name, class_wei
         criterion = torch.nn.CrossEntropyLoss()
         print(f"  Using Uniform Weights (None)")
 
-    # Train
     classifier.train()
     for epoch in range(100):
         optimizer.zero_grad()
@@ -46,8 +44,7 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, device, name, class_wei
         loss = criterion(out, y_train)
         loss.backward()
         optimizer.step()
-    
-    # Evaluate
+
     classifier.eval()
     with torch.no_grad():
         out_test = classifier(X_test)
@@ -58,7 +55,6 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, device, name, class_wei
         y_pred = preds.cpu().numpy()
         y_prob = probs[:, 1].cpu().numpy()
         
-        # Metrics
         acc = (y_true == y_pred).sum() / len(y_true)
         prec = precision_score(y_true, y_pred, pos_label=1, zero_division=0)
         rec = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
@@ -79,35 +75,29 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, device, name, class_wei
 
 def main():
     args = parse_args()
-    
-    # Setup paths
+
     if args.project_root:
         project_root = args.project_root
     else:
         project_root = os.environ.get("PROJECT_ROOT")
         if not project_root:
-            # Assume script is in models/graphCL/
             script_dir = os.path.dirname(os.path.abspath(__file__))
             project_root = os.path.dirname(os.path.dirname(script_dir))
             
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
-    # 1. Load Data (for labels and masks)
+
     data = load_data(project_root)
-    
-    # 2. Load Embeddings
+
     print(f"\nLoading embeddings from {args.embeddings}...")
     embeddings = torch.load(args.embeddings, map_location=device)
     
     if torch.isnan(embeddings).any():
         print("⚠️ Warning: Embeddings contain NaNs. Replacing with 0.")
         embeddings = torch.nan_to_num(embeddings, nan=0.0)
-        
-    # Normalize embeddings (GraphCL usually benefits from this)
+
     embeddings = F.normalize(embeddings, dim=1)
-    
-    # 3. Prepare Splits
+
     y = data.y.to(device)
     labeled_mask = (y != -1)
     train_mask = data.train_mask.to(device) & labeled_mask
@@ -119,22 +109,18 @@ def main():
     
     print(f"\nTrain set size: {len(y_train)}")
     print(f"Test set size:  {len(y_test)}")
-    
-    # Calculate weights
+
     train_class_counts = torch.bincount(y_train)
     weights = 1.0 / train_class_counts.float()
     weights = weights / weights.sum()
     weights = weights.to(device)
-    
-    # 4. Run Evaluations
+
     results = []
-    
-    # Scenario A: Weighted (High Recall)
+
     results.append(train_and_evaluate(X_train, y_train, X_test, y_test, device, 
                                     name="Weighted (Recall Focused)", 
                                     class_weights=weights))
-                                    
-    # Scenario B: Unweighted (Balanced/Precision Focused)
+
     results.append(train_and_evaluate(X_train, y_train, X_test, y_test, device, 
                                     name="Unweighted (Standard)", 
                                     class_weights=None))
